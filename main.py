@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import TensorDataset, DataLoader
+import argparse
 
 env = gym.make("Pendulum-v1")
 # obs, info = env.reset(seed=42)
@@ -18,7 +19,6 @@ def collect_random_data(env, episodes=10):
             a = env.action_space.sample()
             s_next, r, terminated, truncated, info = env.step(a)
             done = terminated or truncated
-            # record = DotMap({"s":s, "a":a, "r":r, "s_next":s_next,"done":done})
             dataset["s"].append(s)
             dataset["a"].append(a)
             dataset["r"].append(r)
@@ -36,8 +36,9 @@ class Standardizer:
         self.std = None
 
     def fit(self, x):
-        self.mean, self.std = torch.std_mean(x, dim=0, keepdim=True)
-        self.std = np.maximum(self.std, self.eps)
+        self.mean = x.mean(axis=0, keepdims=True)
+        self.std = x.std(axis=0, keepdims=True)
+        self.std[self.std < 1e-8] = 1.0
         return self
 
     def transform(self, x):
@@ -62,25 +63,191 @@ class DynamicsMLP(nn.Module):
         return self.net(x)
 
 
-# TODO: implement training function
-def train_mlp_model(dataset):
-    # concat numpy arrays
+def train_dynamics_model(
+    states,
+    actions,
+    next_states,
+    hidden_dim=128,
+    batch_size=256,
+    lr=1e-3,
+    weight_decay=1e-5,
+    max_epochs=200,
+    patience=20,
+    device=None,
+):
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Build supervised dataset
+    X = np.concatenate([states, actions], axis=1).astype(np.float32)
+    Y = (next_states - states).astype(np.float32)
+
+    # Train/val split
+    N = len(X)
+    perm = np.random.permutation(N)
+    train_size = int(0.9 * N)
+    train_idx = perm[:train_size]
+    val_idx = perm[train_size:]
+
+    X_train, Y_train = X[train_idx], Y[train_idx]
+    X_val, Y_val = X[val_idx], Y[val_idx]
+
+    # Fit normalizers on train only
+    x_scaler = Standardizer().fit(X_train)
+    y_scaler = Standardizer().fit(Y_train)
+
+    X_train_n = x_scaler.transform(X_train).astype(np.float32)
+    Y_train_n = y_scaler.transform(Y_train).astype(np.float32)
+    X_val_n = x_scaler.transform(X_val).astype(np.float32)
+    Y_val_n = y_scaler.transform(Y_val).astype(np.float32)
+
+    # PyTorch datasets
+    train_ds = TensorDataset(
+        torch.from_numpy(X_train_n),
+        torch.from_numpy(Y_train_n),
+    )
+    val_ds = TensorDataset(
+        torch.from_numpy(X_val_n),
+        torch.from_numpy(Y_val_n),
+    )
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
+    # Model
+    model = DynamicsMLP(
+        input_dim=X.shape[1],
+        output_dim=Y.shape[1],
+        hidden_dim=hidden_dim,
+    ).to(device)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay,
+    )
+    loss_fn = nn.MSELoss()
+
+    best_val_loss = float("inf")
+    best_state_dict = None
+    epochs_without_improvement = 0
+
+    for epoch in range(max_epochs):
+        # ---- Training ----
+        model.train()
+        train_loss_sum = 0.0
+        train_count = 0
+
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+
+            pred = model(xb)
+            loss = loss_fn(pred, yb)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            train_loss_sum += loss.item() * xb.size(0)
+            train_count += xb.size(0)
+
+        train_loss = train_loss_sum / train_count
+
+        # ---- Validation ----
+        model.eval()
+        val_loss_sum = 0.0
+        val_count = 0
+
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+
+                pred = model(xb)
+                loss = loss_fn(pred, yb)
+
+                val_loss_sum += loss.item() * xb.size(0)
+                val_count += xb.size(0)
+
+        val_loss = val_loss_sum / val_count
+
+        print(
+            f"Epoch {epoch+1:3d} | "
+            f"train_loss={train_loss:.6f} | "
+            f"val_loss={val_loss:.6f}"
+        )
+
+        # ---- Early stopping ----
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state_dict = {
+                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+            }
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        if epochs_without_improvement >= patience:
+            print("Early stopping triggered.")
+            break
+
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+
+    return model, x_scaler, y_scaler
+
+
+def save_model(path, model, x_scaler, y_scaler):
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "x_mean": x_scaler.mean,
+            "x_std": x_scaler.std,
+            "y_mean": y_scaler.mean,
+            "y_std": y_scaler.std,
+        },
+        path,
+    )
+
+
+def load_model(path, input_dim=4, output_dim=3, hidden_dim=128, device="cpu"):
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+
+    model = DynamicsMLP(input_dim, output_dim, hidden_dim)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(device)
+    model.eval()
+
+    x_scaler = Standardizer()
+    x_scaler.mean = checkpoint["x_mean"]
+    x_scaler.std = checkpoint["x_std"]
+
+    y_scaler = Standardizer()
+    y_scaler.mean = checkpoint["y_mean"]
+    y_scaler.std = checkpoint["y_std"]
+
+    return model, x_scaler, y_scaler
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--train", action="store_true")
+args = parser.parse_args()
+
+if args.train:
+    dataset = collect_random_data(env, 50)
     a = np.vstack(dataset["a"])
     s = np.vstack(dataset["s"])
     s_next = np.vstack(dataset["s_next"])
-    delta_s = s_next - s
-    print(a.shape)
-    print(s.shape)
-    print(delta_s.shape)
 
-    Y = delta_s
-    X = np.concatenate([s, a], axis=-1)  # add actions as column
-
-
-# TODO: train simple neural net to predict state transitons (s,a) -> (s_next - s)
-
-dataset = collect_random_data(env, 1)
-train_mlp_model(dataset)
+    model, x_scaler, y_scaler = train_dynamics_model(
+        states=a, actions=s, next_states=s_next
+    )
+    save_model("dynamics_checkpoint.pt", model, x_scaler, y_scaler)
+else:
+    load_model(
+        "dynamics_checkpoint.pt",
+    )
 
 input("Press Enter to close...")
 env.close()
