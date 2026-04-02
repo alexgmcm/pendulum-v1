@@ -245,9 +245,67 @@ if args.train:
     )
     save_model("dynamics_checkpoint.pt", model, x_scaler, y_scaler)
 else:
-    load_model(
+    model, x_scaler, y_scaler = load_model(
         "dynamics_checkpoint.pt",
     )
+
+
+@torch.no_grad()
+def predict_next_state(model, x_scaler, y_scaler, state, action, device=None):
+    if device is None:
+        device = next(model.parameters()).device
+
+    single = state.ndim == 1
+    if single:
+        state = state[None, :]
+        action = action[None, :]
+
+    x = np.concatenate([state, action], axis=1).astype(np.float32)
+    x_n = x_scaler.transform(x).astype(np.float32)
+
+    x_tensor = torch.from_numpy(x_n).to(device)
+    delta_n = model(x_tensor).cpu().numpy()
+    delta = y_scaler.inverse_transform(delta_n)
+
+    next_state_pred = state + delta
+    return next_state_pred[0] if single else next_state_pred
+
+
+@torch.no_grad()
+def evaluate_one_step(
+    model, x_scaler, y_scaler, states, actions, next_states, device=None
+):
+    pred_next = predict_next_state(
+        model, x_scaler, y_scaler, states, actions, device=device
+    )
+    mse = np.mean((pred_next - next_states) ** 2)
+    return mse
+
+
+# for this we need to create 2nd validation set and test trajectories
+# TODO: Generate example trajectory dataset and compare with predicted trajectory from initial state
+@torch.no_grad()
+def rollout_model(model, x_scaler, y_scaler, init_state, actions, device=None):
+    preds = [init_state.copy()]
+    s = init_state.copy()
+
+    for a in actions:
+        s = predict_next_state(model, x_scaler, y_scaler, s, a, device=device)
+        preds.append(s.copy())
+
+    return np.array(preds)
+
+
+def pendulum_reward(state, action):
+    cos_theta, sin_theta, theta_dot = state
+    theta = np.arctan2(sin_theta, cos_theta)
+    u = action[0]
+
+    cost = theta**2 + 0.1 * theta_dot**2 + 0.001 * (u**2)
+    return -cost
+
+
+# TODO: Implement random-shooting MPC
 
 input("Press Enter to close...")
 env.close()
