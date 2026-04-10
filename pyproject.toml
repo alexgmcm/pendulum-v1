@@ -7,5 +7,6 @@ requires-python = ">=3.12"
 dependencies = [
     "gymnasium[classic-control]>=1.2.3",
     "numpy>=2.4.3",
+    "pandas>=3.0.2",
     "torch>=2.11.0",
 ]

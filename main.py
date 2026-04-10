@@ -4,12 +4,13 @@ import torch
 from torch import nn
 from torch.utils.data import TensorDataset, DataLoader
 import argparse
+import json
 
 env = gym.make("Pendulum-v1")
 # obs, info = env.reset(seed=42)
 
 
-def collect_random_data(env, episodes=10):
+def collect_random_data(env, episodes=10, write_to_file=False):
     # get data from random policy
     dataset = {"s": [], "a": [], "r": [], "s_next": [], "done": []}
     for i in range(episodes):
@@ -25,6 +26,14 @@ def collect_random_data(env, episodes=10):
             dataset["s_next"].append(s_next)
             dataset["done"].append(done)
             s = s_next
+
+    if write_to_file:
+        for k, v in dataset.items():
+            print(f"{k}: {type(dataset[k][0])}")
+            if isinstance(dataset[k][0], np.ndarray):
+                dataset[k] = [x.tolist() for x in dataset[k]]
+        with open("output.txt", "w") as f:
+            json.dump(dataset, f, indent=4)
 
     return dataset
 
@@ -230,26 +239,6 @@ def load_model(path, input_dim=4, output_dim=3, hidden_dim=128, device="cpu"):
     return model, x_scaler, y_scaler
 
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--train", action="store_true")
-args = parser.parse_args()
-
-if args.train:
-    dataset = collect_random_data(env, 50)
-    a = np.vstack(dataset["a"])
-    s = np.vstack(dataset["s"])
-    s_next = np.vstack(dataset["s_next"])
-
-    model, x_scaler, y_scaler = train_dynamics_model(
-        states=a, actions=s, next_states=s_next
-    )
-    save_model("dynamics_checkpoint.pt", model, x_scaler, y_scaler)
-else:
-    model, x_scaler, y_scaler = load_model(
-        "dynamics_checkpoint.pt",
-    )
-
-
 @torch.no_grad()
 def predict_next_state(model, x_scaler, y_scaler, state, action, device=None):
     if device is None:
@@ -283,7 +272,7 @@ def evaluate_one_step(
 
 
 # for this we need to create 2nd validation set and test trajectories
-# TODO: Generate example trajectory dataset and compare with predicted trajectory from initial state
+# TODO: Fix model so the predicted trajectories don't explode
 @torch.no_grad()
 def rollout_model(model, x_scaler, y_scaler, init_state, actions, device=None):
     preds = [init_state.copy()]
@@ -303,6 +292,58 @@ def pendulum_reward(state, action):
 
     cost = theta**2 + 0.1 * theta_dot**2 + 0.001 * (u**2)
     return -cost
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--train", action="store_true")
+parser.add_argument("--store_trajectories", action="store_true")
+parser.add_argument("--simulate_trajectories", action="store_true")
+args = parser.parse_args()
+
+if args.store_trajectories:
+    collect_random_data(env, 5, write_to_file=True)
+elif args.train:
+    dataset = collect_random_data(env, 50)
+    a = np.vstack(dataset["a"])
+    s = np.vstack(dataset["s"])
+    s_next = np.vstack(dataset["s_next"])
+
+    model, x_scaler, y_scaler = train_dynamics_model(
+        states=a, actions=s, next_states=s_next
+    )
+    save_model("dynamics_checkpoint.pt", model, x_scaler, y_scaler)
+else:
+    model, x_scaler, y_scaler = load_model(
+        "dynamics_checkpoint.pt",
+    )
+
+
+if args.simulate_trajectories:
+    dataset = collect_random_data(env, 1)
+    endpoints = [i for i, done in enumerate(dataset["done"]) if done]
+    rmse_list = []
+    for i, endpoint in enumerate(endpoints):
+        min_range = endpoints[i - 1] if i != 0 else 0
+        states = dataset["s"][min_range : (endpoint + 1)]
+        init_state = states[0]
+        actions = dataset["a"][min_range:(endpoint)]
+
+        preds = rollout_model(
+            model, x_scaler, y_scaler, init_state, actions, device=None
+        )
+
+        preds_json = [x.tolist() for x in preds]
+        with open("preds.txt", "w") as f:
+            json.dump(preds_json, f, indent=4)
+
+        print(states[:5])
+        print(preds[:5])
+        rmse = np.sqrt(np.mean((preds - states) ** 2))
+        print(np.max(np.abs(preds)))
+        print(np.max(np.abs(states)))
+        print(np.max(np.abs(preds - states)))
+        rmse_list.append(rmse)
+    print(f"avg rmse: {np.mean(rmse_list)}")
 
 
 # TODO: Implement random-shooting MPC

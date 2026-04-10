@@ -3,3 +3,5 @@ __pycache__
 .ipynb_checkpoints
 dataset.txt
 *.pt
+output.txt
+preds.txt
